@@ -5,6 +5,7 @@ import struct Foundation.Data
 import struct Foundation.Date
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
+import class Foundation.JSONSerialization
 
 /// Model Context Protocol client
 public actor Client {
@@ -88,11 +89,11 @@ public actor Client {
     private var task: Task<Void, Never>?
 
     /// A pending request with a continuation for the result
-    private struct PendingRequest<T> {
-        let continuation: CheckedContinuation<T, Swift.Error>
+    private struct PendingRequest {
+        let continuation: CheckedContinuation<String, Swift.Error>
     }
     /// A dictionary of type-erased pending requests, keyed by request ID
-    private var pendingRequests: [ID: Any] = [:]
+    private var pendingRequests: [ID: PendingRequest] = [:]
 
     public init(
         name: String,
@@ -127,10 +128,20 @@ public actor Client {
                             throw Error.parseError("Invalid UTF-8 data")
                         }
 
+                        let responseDict = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
+                        
                         // Attempt to decode string data as AnyResponse or AnyMessage
                         let decoder = JSONDecoder()
                         if let response = try? decoder.decode(AnyResponse.self, from: data) {
-                            await handleResponse(response, for: response)
+                            if let request = pendingRequests[response.id] {
+                                let result = response.result.map { _ in
+                                    let data = try! JSONSerialization.data(withJSONObject: responseDict!["result"]!)
+                                    return String(data: data, encoding: .utf8)!
+                                }
+                                await handleResponse(id: response.id, result: result, for: request)
+                            } else {
+                                await logger?.warning("Unexpected reponse \(response.id) received by client")
+                            }
                         } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
                             await handleMessage(message)
                         } else {
@@ -157,12 +168,7 @@ public actor Client {
     /// Disconnect the client and cancel all pending requests
     public func disconnect() async {
         // Cancel all pending requests
-        for (id, request) in pendingRequests {
-            // We know this cast is safe because we only store PendingRequest values
-            if let typedRequest = request as? PendingRequest<Any> {
-                typedRequest.continuation.resume(
-                    throwing: Error.internalError("Client disconnected"))
-            }
+        for (id, _) in pendingRequests {
             pendingRequests.removeValue(forKey: id)
         }
 
@@ -200,13 +206,12 @@ public actor Client {
             throw Error.internalError("Failed to encode request")
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
+        let value = try await withCheckedThrowingContinuation { continuation in
             // Store the pending request first
             Task {
                 self.addPendingRequest(
                     id: request.id,
-                    continuation: continuation,
-                    type: M.Result.self
+                    continuation: continuation
                 )
 
                 // Send the request
@@ -218,12 +223,13 @@ public actor Client {
                 }
             }
         }
+        
+        return try JSONDecoder().decode(M.Result.self, from: Data(value.utf8))
     }
 
-    private func addPendingRequest<T>(
+    private func addPendingRequest(
         id: ID,
-        continuation: CheckedContinuation<T, Swift.Error>,
-        type: T.Type
+        continuation: CheckedContinuation<String, Swift.Error>
     ) {
         pendingRequests[id] = PendingRequest(continuation: continuation)
     }
@@ -320,22 +326,19 @@ public actor Client {
 
     // MARK: -
 
-    private func handleResponse(_ response: Response<AnyMethod>, for request: Any) async {
+    private func handleResponse(id: ID, result: Result<String, Error>, for request: PendingRequest) async {
         await logger?.debug(
             "Processing response",
-            metadata: ["id": "\(response.id)"])
+            metadata: ["id": "\(id)"])
 
-        // We know this cast is safe because we only store PendingRequest values
-        guard let typedRequest = request as? PendingRequest<Any> else { return }
-
-        switch response.result {
+        switch result {
         case .success(let value):
-            typedRequest.continuation.resume(returning: value)
+            request.continuation.resume(returning: value)
         case .failure(let error):
-            typedRequest.continuation.resume(throwing: error)
+            request.continuation.resume(throwing: error)
         }
 
-        removePendingRequest(id: response.id)
+        removePendingRequest(id: id)
     }
 
     private func handleMessage(_ message: Message<AnyNotification>) async {
