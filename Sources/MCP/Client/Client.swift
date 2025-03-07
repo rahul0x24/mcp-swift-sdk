@@ -90,7 +90,7 @@ public actor Client {
 
     /// A pending request with a continuation for the result
     private struct PendingRequest {
-        let continuation: CheckedContinuation<String, Swift.Error>
+        let continuation: CheckedContinuation<Data, Swift.Error>
     }
     /// A dictionary of type-erased pending requests, keyed by request ID
     private var pendingRequests: [ID: PendingRequest] = [:]
@@ -128,17 +128,11 @@ public actor Client {
                             throw Error.parseError("Invalid UTF-8 data")
                         }
 
-                        let responseDict = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
-                        
                         // Attempt to decode string data as AnyResponse or AnyMessage
                         let decoder = JSONDecoder()
                         if let response = try? decoder.decode(AnyResponse.self, from: data) {
                             if let request = pendingRequests[response.id] {
-                                let result = response.result.map { _ in
-                                    let data = try! JSONSerialization.data(withJSONObject: responseDict!["result"]!)
-                                    return String(data: data, encoding: .utf8)!
-                                }
-                                await handleResponse(id: response.id, result: result, for: request)
+                                await handleResponse(id: response.id, data: data, for: request)
                             } else {
                                 await logger?.warning("Unexpected reponse \(response.id) received by client")
                             }
@@ -224,12 +218,12 @@ public actor Client {
             }
         }
         
-        return try JSONDecoder().decode(M.Result.self, from: Data(value.utf8))
+        return try JSONDecoder().decode(Response<M>.self, from: value).result.get()
     }
 
     private func addPendingRequest(
         id: ID,
-        continuation: CheckedContinuation<String, Swift.Error>
+        continuation: CheckedContinuation<Data, Swift.Error>
     ) {
         pendingRequests[id] = PendingRequest(continuation: continuation)
     }
@@ -326,18 +320,15 @@ public actor Client {
 
     // MARK: -
 
-    private func handleResponse(id: ID, result: Result<String, Error>, for request: PendingRequest) async {
+    private func handleResponse(
+        id: ID,
+        data: Data,
+        for request: PendingRequest
+    ) async {
         await logger?.debug(
             "Processing response",
             metadata: ["id": "\(id)"])
-
-        switch result {
-        case .success(let value):
-            request.continuation.resume(returning: value)
-        case .failure(let error):
-            request.continuation.resume(throwing: error)
-        }
-
+        request.continuation.resume(returning: data)
         removePendingRequest(id: id)
     }
 
